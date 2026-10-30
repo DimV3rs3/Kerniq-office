@@ -1,0 +1,13 @@
+plugin_id = "office"
+name = "Office"
+version = "0.1.1"
+api_version = "1.0"
+manifest_version = "1.0"
+entry_point = "main.PluginImpl"
+description = "Creates and edits Word, Excel, PowerPoint, and LibreOffice documents. Tables, styles, and fonts stay structured."
+capabilities = ["tools"]
+author = "Kerniq"
+license = "MIT"
+
+[tools]
+expose_to_agent = true
