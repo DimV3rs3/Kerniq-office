@@ -479,7 +479,10 @@ class OfficeEditTool(_OfficeTool):
             "Edit an existing Office document in place. Do not use edit_file or write_file. "
             "ops is a list. Documents (docx, odt): set_paragraph {index, text, style, font, size_pt, bold, italic}, "
             "add_paragraph, set_style {index, style}, set_cell {table, row, col, text, font, size_pt, bold}, add_table {cells}. "
-            "Spreadsheets (xlsx, ods): set_sheet_cell {sheet, row, col, value, font, size_pt, bold}. "
+            "Spreadsheets (xlsx, ods): set_sheet_cell {sheet, row, col, value}, "
+            "set_cells {sheet, cells}, or append_row {sheet, values}. "
+            "A value that starts with = is a formula, not text. "
+            "Booleans stay booleans. Other sheets and the workbook styles are left as they are. "
             "Slides (pptx, odp): set_slide {number, title, body, font, size_pt}, add_slide. "
             "Every index, table, row, and column starts at 1. Paragraph indexes skip text inside tables."
         )

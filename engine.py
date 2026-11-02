@@ -1175,6 +1175,87 @@ def _xlsx_cols(widths: dict[int, float]) -> ET.Element:
     return cols
 
 
+def _is_formula(value) -> bool:
+    return isinstance(value, str) and value.startswith("=") and len(value) > 1
+
+
+def _write_xlsx_value(node: ET.Element, value) -> None:
+    """Put a value into a cell without discarding the rest of the worksheet."""
+    for child in list(node):
+        local = child.tag.split("}", 1)[-1]
+        if local in {"v", "is", "f"}:
+            node.remove(child)
+    if isinstance(value, dict):
+        value = _cell_value(value)
+    if _is_formula(value):
+        node.attrib.pop("t", None)
+        ET.SubElement(node, q(S, "f")).text = str(value)[1:]
+        return
+    if isinstance(value, bool):
+        node.set("t", "b")
+        ET.SubElement(node, q(S, "v")).text = "1" if value else "0"
+        return
+    if value is None or value == "":
+        node.attrib.pop("t", None)
+        return
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        node.attrib.pop("t", None)
+        ET.SubElement(node, q(S, "v")).text = str(value)
+        return
+    node.set("t", "inlineStr")
+    ET.SubElement(ET.SubElement(node, q(S, "is")), q(S, "t")).text = str(value)
+
+
+def _style_requested(op: dict) -> bool:
+    return any(op.get(key) not in (None, "") for key in ("font", "bold", "italic", "size_pt"))
+
+
+def _xlsx_ensure_style(parts: dict[str, bytes], key: tuple) -> str | None:
+    """Append one font and one cell xf. Never rebuild the stylesheet."""
+    if "xl/styles.xml" not in parts:
+        return None
+    root = _parse(parts["xl/styles.xml"])
+    fonts = root.find(q(S, "fonts"))
+    xfs = root.find(q(S, "cellXfs"))
+    if fonts is None or xfs is None:
+        return None
+    font_nodes = list(fonts)
+    xf_nodes = list(xfs)
+    want_name, want_size, want_bold, want_italic = key
+    for index, xf in enumerate(xf_nodes):
+        font_id = int(xf.get("fontId") or 0)
+        if font_id < 0 or font_id >= len(font_nodes):
+            continue
+        font = font_nodes[font_id]
+        name = font.find(q(S, "name"))
+        size = font.find(q(S, "sz"))
+        current = (
+            name.get("val") if name is not None else "Calibri",
+            float(size.get("val")) if size is not None and size.get("val") else 11.0,
+            font.find(q(S, "b")) is not None,
+            font.find(q(S, "i")) is not None,
+        )
+        if current == (want_name, float(want_size), bool(want_bold), bool(want_italic)):
+            return str(index)
+    font = ET.SubElement(fonts, q(S, "font"))
+    if want_bold:
+        ET.SubElement(font, q(S, "b"))
+    if want_italic:
+        ET.SubElement(font, q(S, "i"))
+    ET.SubElement(font, q(S, "sz"), {"val": str(want_size)})
+    ET.SubElement(font, q(S, "name"), {"val": str(want_name)})
+    fonts.set("count", str(len(list(fonts))))
+    xf = ET.SubElement(xfs, q(S, "xf"), {
+        "fontId": str(len(list(fonts)) - 1),
+        "fillId": "0",
+        "borderId": "0",
+        "applyFont": "1",
+    })
+    xfs.set("count", str(len(list(xfs))))
+    parts["xl/styles.xml"] = _xml(root)
+    return str(len(list(xfs)) - 1)
+
+
 def _xlsx_sheet(cells: list[dict], style_ids: dict[tuple, int]) -> bytes:
     root = ET.Element(q(S, "worksheet"))
     widths: dict[int, float] = {}
@@ -1198,16 +1279,7 @@ def _xlsx_sheet(cells: list[dict], style_ids: dict[tuple, int]) -> bytes:
             font, size, bold, italic = _font_of(cell, style="Normal")
             ref = f"{_col_letter(int(cell['col']))}{row_n}"
             node = ET.SubElement(row, q(S, "c"), {"r": ref, "s": str(style_ids[(font, size, bold, italic)])})
-            value = cell.get("value")
-            if isinstance(value, dict):
-                value = _as_text(value)
-            if isinstance(value, bool):
-                value = "TRUE" if value else "FALSE"
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                ET.SubElement(node, q(S, "v")).text = str(value)
-            else:
-                node.set("t", "inlineStr")
-                ET.SubElement(ET.SubElement(node, q(S, "is")), q(S, "t")).text = "" if value is None else str(value)
+            _write_xlsx_value(node, cell.get("value"))
     return _xml(root)
 
 
@@ -1302,13 +1374,19 @@ def _sheet_cells(sheet: ET.Element, styles: list[dict], shared: list[str] | None
         if int(node.get("s") or 0) >= len(styles):
             style = {}
         kind = node.get("t")
+        formula = node.find(q(S, "f"))
         value: object
-        if kind == "inlineStr":
+        if formula is not None and formula.text:
+            value = "=" + formula.text
+        elif kind == "inlineStr":
             value = _text_of(node, q(S, "t"))
         elif kind == "s":
             raw = node.find(q(S, "v"))
             index = int(raw.text) if raw is not None and str(raw.text or "").isdigit() else -1
             value = shared[index] if 0 <= index < len(shared) else ""
+        elif kind == "b":
+            raw = node.find(q(S, "v"))
+            value = str(raw.text if raw is not None else "") in {"1", "true", "TRUE"}
         else:
             raw = node.find(q(S, "v"))
             value = raw.text if raw is not None else ""
@@ -1383,32 +1461,105 @@ def _xlsx_refresh_widths(root: ET.Element, shared: list[str] | None = None) -> N
         root.insert(list(root).index(data), cols)
 
 
-def _edit_xlsx(parts: dict[str, bytes], ops: list) -> None:
-    styles = _read_xlsx_styles(parts)
-    shared = _shared_strings(parts)
-    font_keys = [(item.get("font") or "Calibri", float(item.get("size_pt") or 11), bool(item.get("bold")), bool(item.get("italic"))) for item in styles]
+def _sheet_target(parts: dict[str, bytes], wanted: str) -> str:
     sheets = _workbook_sheets(parts)
-    for op in ops:
-        if str(op.get("op") or "") != "set_sheet_cell":
-            raise OfficeError("Spreadsheets take set_sheet_cell. Documents take set_paragraph, and slides take set_slide.")
-        wanted = str(op.get("sheet") or "1")
-        match = None
-        for index, (name, target) in enumerate(sheets, start=1):
-            if wanted == name or wanted == str(index):
-                match = target
+    for index, (name, target) in enumerate(sheets, start=1):
+        if wanted == name or wanted == str(index):
+            if target not in parts:
                 break
-        if match is None or match not in parts:
-            raise OfficeError(f"Sheet {wanted} was not found.")
+            return target
+    raise OfficeError(f"Sheet {wanted} was not found.")
+
+
+def _used_rows(root: ET.Element) -> int:
+    rows = [int(item.get("r") or 0) for item in root.findall(".//" + q(S, "row"))]
+    return max(rows) if rows else 0
+
+
+def _expand_sheet_ops(parts: dict[str, bytes], ops: list) -> list:
+    expanded = []
+    for op in ops:
+        name = str(op.get("op") or "set_sheet_cell")
+        sheet = op.get("sheet") or op.get("name") or "1"
+        if name in {"set_sheet_cell", "set_cell"}:
+            item = dict(op)
+            item["op"] = "set_sheet_cell"
+            item["sheet"] = sheet
+            expanded.append(item)
+            continue
+        if name in {"set_cells", "write_cells"}:
+            for cell in _cells_of(op.get("cells") or op.get("values") or []):
+                expanded.append({
+                    "op": "set_sheet_cell",
+                    "sheet": sheet,
+                    "row": cell.get("row"),
+                    "col": cell.get("col"),
+                    "value": cell.get("value"),
+                    "font": cell.get("font", op.get("font")),
+                    "size_pt": cell.get("size_pt", op.get("size_pt")),
+                    "bold": cell.get("bold", op.get("bold")),
+                    "italic": cell.get("italic", op.get("italic")),
+                })
+            continue
+        if name in {"append_row", "add_row"}:
+            target = _sheet_target(parts, str(sheet))
+            root = _parse(parts[target])
+            row_n = _used_rows(root) + 1
+            values = op.get("values") if op.get("values") is not None else op.get("cells") or []
+            if isinstance(values, dict):
+                values = _cells_of(values)
+            for col, value in enumerate(list(values), start=1):
+                if isinstance(value, dict):
+                    expanded.append({
+                        "op": "set_sheet_cell",
+                        "sheet": sheet,
+                        "row": value.get("row") or row_n,
+                        "col": value.get("col") or col,
+                        "value": value.get("value", value.get("text")),
+                        "font": value.get("font", op.get("font")),
+                        "bold": value.get("bold", op.get("bold")),
+                        "italic": value.get("italic", op.get("italic")),
+                        "size_pt": value.get("size_pt", op.get("size_pt")),
+                    })
+                else:
+                    expanded.append({
+                        "op": "set_sheet_cell",
+                        "sheet": sheet,
+                        "row": row_n,
+                        "col": col,
+                        "value": value,
+                    })
+            continue
+        raise OfficeError(
+            "Spreadsheets take set_sheet_cell, set_cells, or append_row. "
+            "A formula is a value that starts with =."
+        )
+    return expanded
+
+
+def _edit_xlsx(parts: dict[str, bytes], ops: list) -> None:
+    pending = [dict(op) for op in ops]
+    while pending:
+        op = pending.pop(0)
+        name = str(op.get("op") or "set_sheet_cell")
+        if name in {"append_row", "add_row", "set_cells", "write_cells"}:
+            pending = _expand_sheet_ops(parts, [op]) + pending
+            continue
+        if name not in {"set_sheet_cell", "set_cell"}:
+            raise OfficeError(
+                "Spreadsheets take set_sheet_cell, set_cells, or append_row. "
+                "A formula is a value that starts with =."
+            )
+        wanted = str(op.get("sheet") or op.get("name") or "1")
+        match = _sheet_target(parts, wanted)
         root = _parse(parts[match])
         data = root.find(q(S, "sheetData"))
         if data is None:
             data = ET.SubElement(root, q(S, "sheetData"))
         row_n = int(op.get("row") or 1)
         col_n = int(op.get("col") or 1)
-        key = _font_of(op, style="Normal")
-        if key not in font_keys:
-            font_keys.append(key)
-        style_id = font_keys.index(key)
+        if row_n < 1 or col_n < 1:
+            raise OfficeError("Row and column start at 1.")
         ref = f"{_col_letter(col_n)}{row_n}"
         row = next((item for item in data.findall(q(S, "row")) if item.get("r") == str(row_n)), None)
         if row is None:
@@ -1424,19 +1575,13 @@ def _edit_xlsx(parts: dict[str, bytes], ops: list) -> None:
         cell = next((item for item in row.findall(q(S, "c")) if item.get("r") == ref), None)
         if cell is None:
             cell = ET.SubElement(row, q(S, "c"), {"r": ref})
-        for child in list(cell):
-            cell.remove(child)
-        cell.set("s", str(style_id))
-        value = _cell_value(op.get("value", op.get("text")))
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            cell.attrib.pop("t", None)
-            ET.SubElement(cell, q(S, "v")).text = str(value)
-        else:
-            cell.set("t", "inlineStr")
-            ET.SubElement(ET.SubElement(cell, q(S, "is")), q(S, "t")).text = "" if value is None else str(value)
-        _xlsx_refresh_widths(root, shared)
+        if _style_requested(op):
+            key = _font_of(op, style="Normal")
+            style_id = _xlsx_ensure_style(parts, key)
+            if style_id is not None:
+                cell.set("s", style_id)
+        _write_xlsx_value(cell, _cell_value(op.get("value", op.get("text"))))
         parts[match] = _xml(root)
-    parts["xl/styles.xml"] = _xlsx_styles(font_keys)
 
 
 _THEME = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -2025,8 +2170,14 @@ def _read_ods(parts: dict[str, bytes]) -> dict:
             col_n = 1
             for cell in row.findall(q(TABLE, "table-cell")):
                 repeat = int(cell.get(q(TABLE, "number-columns-repeated")) or 1)
+                formula = cell.get(q(TABLE, "formula"))
                 value = cell.get(q(OFFICE, "value"))
-                if value is None:
+                if formula:
+                    text = formula[3:] if str(formula).startswith("of:") else str(formula)
+                    value = text if str(text).startswith("=") else "=" + str(text).lstrip("=")
+                elif cell.get(q(OFFICE, "value-type")) == "boolean":
+                    value = str(cell.get(q(OFFICE, "boolean-value")) or "").lower() == "true"
+                elif value is None:
                     value = "".join(cell.itertext())
                 else:
                     try:
@@ -2059,9 +2210,27 @@ def _edit_ods(parts: dict[str, bytes], ops: list) -> None:
     host = root.find(q(OFFICE, "body")).find(q(OFFICE, "spreadsheet"))
     counter = [len(list(auto))]
     tables = [] if host is None else host.findall(q(TABLE, "table"))
+    prepared = []
     for op in ops:
-        if str(op.get("op") or "") != "set_sheet_cell":
-            raise OfficeError("Spreadsheets take set_sheet_cell.")
+        name = str(op.get("op") or "set_sheet_cell")
+        sheet = op.get("sheet") or "1"
+        if name in {"set_cells", "write_cells"}:
+            for cell in _cells_of(op.get("cells") or op.get("values") or []):
+                prepared.append({
+                    "op": "set_sheet_cell",
+                    "sheet": sheet,
+                    "row": cell.get("row"),
+                    "col": cell.get("col"),
+                    "value": cell.get("value"),
+                })
+        elif name in {"append_row", "add_row", "set_sheet_cell", "set_cell"}:
+            item = dict(op)
+            item["op"] = name if name in {"append_row", "add_row"} else "set_sheet_cell"
+            item["sheet"] = sheet
+            prepared.append(item)
+        else:
+            raise OfficeError("Spreadsheets take set_sheet_cell, set_cells, or append_row.")
+    for op in prepared:
         wanted = str(op.get("sheet") or "1")
         table = None
         for index, candidate in enumerate(tables, start=1):
@@ -2070,6 +2239,18 @@ def _edit_ods(parts: dict[str, bytes], ops: list) -> None:
                 break
         if table is None:
             raise OfficeError(f"Sheet {wanted} was not found.")
+        if op["op"] == "append_row":
+            row_n = len(table.findall(q(TABLE, "table-row"))) + 1
+            values = op.get("values") if op.get("values") is not None else op.get("cells") or []
+            for col, value in enumerate(list(values), start=1):
+                prepared.append({
+                    "op": "set_sheet_cell",
+                    "sheet": wanted,
+                    "row": row_n,
+                    "col": col,
+                    "value": value.get("value") if isinstance(value, dict) else value,
+                })
+            continue
         row_n = int(op.get("row") or 1)
         col_n = int(op.get("col") or 1)
         rows = table.findall(q(TABLE, "table-row"))
@@ -2083,15 +2264,29 @@ def _edit_ods(parts: dict[str, bytes], ops: list) -> None:
         for child in list(cell):
             cell.remove(child)
         value = _cell_value(op.get("value", op.get("text")))
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        for child in list(cell):
+            cell.remove(child)
+        if _is_formula(value):
+            cell.set(q(OFFICE, "value-type"), "float")
+            cell.set(q(TABLE, "formula"), "of:" + str(value))
+            spec = dict(op)
+            spec["text"] = str(value)
+        elif isinstance(value, bool):
+            cell.set(q(OFFICE, "value-type"), "boolean")
+            cell.set(q(OFFICE, "boolean-value"), "true" if value else "false")
+            spec = dict(op)
+            spec["text"] = "TRUE" if value else "FALSE"
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
             cell.set(q(OFFICE, "value-type"), "float")
             cell.set(q(OFFICE, "value"), str(value))
+            spec = dict(op)
+            spec["text"] = str(value)
         else:
             cell.set(q(OFFICE, "value-type"), "string")
             if q(OFFICE, "value") in cell.attrib:
                 del cell.attrib[q(OFFICE, "value")]
-        spec = dict(op)
-        spec["text"] = "" if value is None else str(value)
+            spec = dict(op)
+            spec["text"] = "" if value is None else str(value)
         cell.append(_odf_paragraph(spec, auto, counter))
         _ods_widen(table, auto, counter, col_n, spec["text"])
     parts["content.xml"] = _xml(root)
