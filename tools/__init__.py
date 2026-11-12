@@ -245,7 +245,7 @@ def _paragraph_line(paragraph: dict) -> str:
         bits.append("bold")
     if paragraph.get("italic"):
         bits.append("italic")
-    return f"{paragraph.get('n')}. {' · '.join(bits)} — {_md_cell(paragraph.get('text') or '')}"
+    return f"{paragraph.get('n')}. {' · '.join(bits)} – {_md_cell(paragraph.get('text') or '')}"
 
 
 def _grid_markdown(rows: list) -> list[str]:
